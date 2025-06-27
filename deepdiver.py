@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
+    AutoConfig,
     TrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
@@ -23,12 +24,18 @@ from bs4 import BeautifulSoup
 from bs4.element import Comment
 import numpy as np
 
+# New imports for modularized components
+from dataset_module import WebPuzzleDataset
+from search_module import DuckDuckGoSearcher
+from reward_module import calculate_reward
+from agent_module import DeepDiverAgent
+
 # 1. 配置参数（显存优化版）
 class DeepDiverConfig:
     def __init__(self):
         # 模型设置 - 使用4-bit量化
         self.model_name = "Qwen/Qwen2.5-3B"  # 更小模型节省显存
-        self.use_4bit = True
+        self.use_4bit = False
         self.bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -58,7 +65,7 @@ class DeepDiverConfig:
         self.cliprange_value = 0.2
         
         # 路径设置
-        self.dataset_path = "webpuzzle_dataset_3735.jsonl.jsonl"  # 3735条数据
+        self.dataset_path = "webpuzzle_dataset_3735.jsonl"  # 3735条数据
         self.output_dir = "./deepdiver_output"
         self.sft_output_dir = os.path.join(self.output_dir, "sft_model")
         self.ppo_output_dir = os.path.join(self.output_dir, "ppo_model")
@@ -69,277 +76,43 @@ class DeepDiverConfig:
         os.makedirs(self.sft_output_dir, exist_ok=True)
         os.makedirs(self.ppo_output_dir, exist_ok=True)
 
-# 2. 数据处理
-class WebPuzzleDataset(Dataset):
-    def __init__(self, config, tokenizer, mode='train'):
-        """
-        mode: 'train' 或 'val'
-        """
-        self.config = config
-        self.tokenizer = tokenizer
-        self.mode = mode
-        self.data = self.load_and_preprocess_data()
-        
-    def load_and_preprocess_data(self):
-        """加载并预处理数据，按80%训练集和20%验证集划分"""
-        # 首先检查验证集是否已经存在
-        if self.mode == 'val' and os.path.exists(self.config.val_dataset_path):
-            return self.load_val_dataset()
-            
-        # 加载完整数据集
-        full_data = []
-        with open(self.config.dataset_path, 'r', encoding='utf-8') as f:
-            for line in tqdm(f, desc="Loading full dataset"):
-                item = json.loads(line)
-                full_data.append(item)
-        
-        print(f"Loaded {len(full_data)} samples in total")
-        
-        # 划分训练集和验证集 (80% 训练, 20% 验证)
-        total_size = len(full_data)
-        train_size = int(0.8 * total_size)
-        val_size = total_size - train_size
-        
-        # 随机打乱数据
-        rng = np.random.default_rng(42)  # 固定随机种子确保可复现
-        indices = rng.permutation(total_size)
-        
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:]
-        
-        # 保存验证集到单独文件
-        val_data = [full_data[i] for i in val_indices]
-        with open(self.config.val_dataset_path, 'w', encoding='utf-8') as f:
-            for item in val_data:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
-        print(f"Saved validation dataset with {len(val_data)} samples")
-        
-        # 根据模式返回相应数据
-        if self.mode == 'train':
-            data = [full_data[i] for i in train_indices]
-            print(f"Using {len(data)} samples for training")
-        else:
-            data = val_data
-            print(f"Using {len(data)} samples for validation")
-        
-        # 格式化数据
-        formatted_data = []
-        for item in data:
-            # 构建训练样本
-            prompt = (
-                "你是一个信息搜索专家，需要解决以下问题：\n"
-                f"问题：{item['question']}\n"
-                "请按步骤进行推理和搜索：\n"
-            )
-            
-            # 添加难度信息
-            if 'difficulty' in item:
-                prompt += f"问题难度：{item['difficulty']}\n"
-            
-            formatted_data.append({
-                "prompt": prompt,
-                "answer": item.get("answer", ""),
-                "difficulty": item.get("difficulty", "medium"),
-                "question": item.get("question", "")
-            })
-        
-        return formatted_data
-    
-    def load_val_dataset(self):
-        """从文件加载验证集"""
-        data = []
-        with open(self.config.val_dataset_path, 'r', encoding='utf-8') as f:
-            for line in tqdm(f, desc="Loading validation dataset"):
-                item = json.loads(line)
-                
-                # 构建验证样本
-                prompt = (
-                    "你是一个信息搜索专家，需要解决以下问题：\n"
-                    f"问题：{item['question']}\n"
-                    "请按步骤进行推理和搜索：\n"
-                )
-                
-                # 添加难度信息
-                if 'difficulty' in item:
-                    prompt += f"问题难度：{item['difficulty']}\n"
-                
-                data.append({
-                    "prompt": prompt,
-                    "answer": item.get("answer", ""),
-                    "difficulty": item.get("difficulty", "medium"),
-                    "question": item.get("question", "")
-                })
-        
-        print(f"Loaded {len(data)} validation samples")
-        return data
-    
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        return self.data[idx]
-    
-    def format_for_sft(self, item):
-        """为监督微调格式化数据"""
-        text = item['prompt'] + "\n推理过程："
-        return text
-    
-    def format_for_ppo(self, item):
-        """为PPO训练格式化数据"""
-        return item['prompt']
+# 新增: 将TokenizedDataset类提升到模块级别
+class TokenizedDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings):
+        self.encodings = encodings
+        # Ensure labels are correctly assigned
+        self.encodings["labels"] = self.encodings["input_ids"].clone()
 
-# 3. DuckDuckGo 搜索工具（完整实现）
-class DuckDuckGoSearcher:
-    def __init__(self, max_results=3, min_delay=1.0, max_retries=3):
-        self.max_results = max_results
-        self.min_delay = min_delay
-        self.max_retries = max_retries
-        self.last_search_time = 0
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        
-    def search(self, query):
-        """执行DuckDuckGo搜索"""
-        # 遵守速率限制
-        current_time = time.time()
-        if current_time - self.last_search_time < self.min_delay:
-            time.sleep(self.min_delay - (current_time - self.last_search_time))
-        
-        retries = 0
-        while retries < self.max_retries:
-            try:
-                with DDGS() as ddgs:
-                    results = []
-                    for r in ddgs.text(query, max_results=self.max_results):
-                        # 获取更完整的页面内容
-                        full_content = self.get_page_content(r.get('href', ''))
-                        if full_content:
-                            # 从页面内容中提取更相关的摘要
-                            summary = self.extract_relevant_content(full_content, query)
-                            if summary:
-                                r['snippet'] = summary
-                        
-                        results.append({
-                            "title": r.get('title', ''),
-                            "url": r.get('href', ''),
-                            "snippet": r.get('body', r.get('snippet', ''))
-                        })
-                    
-                    self.last_search_time = time.time()
-                    return results
-            except Exception as e:
-                print(f"搜索出错 (尝试 {retries+1}/{self.max_retries}): {str(e)}")
-                retries += 1
-                time.sleep(2)
-        
-        print(f"搜索失败: {query}")
-        return [{"error": "搜索服务不可用，请稍后再试"}]
-    
-    def get_page_content(self, url, timeout=5):
-        """获取网页内容"""
-        if not url.startswith('http'):
-            return ""
-        
-        try:
-            response = requests.get(url, headers=self.headers, timeout=timeout)
-            response.raise_for_status()
-            return response.text
-        except Exception as e:
-            print(f"获取页面内容失败: {url} - {str(e)}")
-            return ""
-    
-    def tag_visible(self, element):
-        """检查HTML元素是否可见"""
-        if element.parent.name in ['style', 'script', 'head', 'title', 'meta', '[document]']:
-            return False
-        if isinstance(element, Comment):
-            return False
-        return True
-    
-    def extract_relevant_content(self, html_content, query, max_length=500):
-        """从HTML内容中提取与查询相关的部分"""
-        try:
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # 提取所有可见文本
-            texts = soup.findAll(string=True)
-            visible_texts = filter(self.tag_visible, texts)
-            text = " ".join(t.strip() for t in visible_texts if t.strip())
-            
-            # 清理文本
-            text = re.sub(r'\s+', ' ', text)
-            
-            # 查找与查询相关的部分
-            query_words = set(query.lower().split())
-            sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s', text)
-            
-            relevant_sentences = []
-            for sentence in sentences:
-                sentence_words = set(re.findall(r'\b\w+\b', sentence.lower()))
-                if query_words & sentence_words:  # 如果有共同词汇
-                    relevant_sentences.append(sentence)
-            
-            # 选择最相关的部分
-            if relevant_sentences:
-                # 按包含查询词的数量排序
-                relevant_sentences.sort(
-                    key=lambda s: len(set(re.findall(r'\b\w+\b', s.lower())) & query_words),
-                    reverse=True
-                )
-                result = " ".join(relevant_sentences[:3])[:max_length]
-            else:
-                # 没有找到直接相关的内容，返回开头部分
-                result = text[:max_length]
-            
-            # 添加省略号如果内容被截断
-            if len(result) == max_length:
-                result += "..."
-                
-            return result
-        except Exception as e:
-            print(f"提取内容失败: {str(e)}")
-            return ""
-    
-    def format_results(self, results):
-        """完整实现：格式化搜索结果"""
-        if not results:
-            return "没有找到相关信息"
-        
-        # 处理错误情况
-        if "error" in results[0]:
-            return f"搜索错误: {results[0]['error']}"
-        
-        formatted = []
-        for i, result in enumerate(results[:self.max_results], 1):
-            title = result.get('title', '无标题').strip()
-            url = result.get('url', '无URL').strip()
-            snippet = result.get('snippet', '无摘要').strip()
-            
-            # 清理和截断文本
-            title = html.unescape(title)
-            snippet = html.unescape(snippet)
-            
-            if len(title) > 80:
-                title = title[:77] + "..."
-                
-            if len(snippet) > 200:
-                snippet = snippet[:197] + "..."
-            
-            # 格式化结果
-            formatted.append(f"结果 {i}: {title}\n链接: {url}\n摘要: {snippet}")
-        
-        return "\n\n".join(formatted)
+    def __len__(self):
+        return len(self.encodings["input_ids"])
+
+    def __getitem__(self, idx):
+        item = {}
+        for key, val in self.encodings.items():
+            # 确保返回张量而不是切片操作
+            tensor = val[idx].clone().detach()
+            item[key] = tensor
+        return item
 
 # 4. 冷启动监督微调（SFT）
 def run_sft_training(config):
     # 加载模型和分词器
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    model_kwargs = {}
+    
+    if config.use_4bit:
+        model_kwargs["quantization_config"] = config.bnb_config
+    
+    model_kwargs["torch_dtype"] = torch.bfloat16
+    model_kwargs["device_map"] = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Load config explicitly
+    model_config = AutoConfig.from_pretrained(config.model_name)
+    
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        quantization_config=config.bnb_config if config.use_4bit else None,
-        torch_dtype=torch.bfloat16,
-        device_map="auto"
+        config=model_config,
+        **model_kwargs
     )
     
     # 配置LoRA
@@ -347,11 +120,19 @@ def run_sft_training(config):
         r=config.lora_rank,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],  # Add gate/up/down for MLP layers
         task_type="CAUSAL_LM",
+        inference_mode=False
     )
+    
+    # 修复1: 确保模型准备正确
     model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, peft_config)
+    
+    # 修复2: 禁用缓存并启用输入梯度要求
+    model.config.use_cache = False
+    model.enable_input_require_grads()
+    
     model.print_trainable_parameters()
     
     # 准备数据集（只使用训练集）
@@ -366,6 +147,9 @@ def run_sft_training(config):
         padding="max_length",
         return_tensors="pt"
     )
+    
+    # 使用定义在模块级别的TokenizedDataset类
+    train_dataset = TokenizedDataset(tokenized_data)
     
     # 创建数据加载器
     data_collator = DataCollatorForLanguageModeling(
@@ -384,6 +168,9 @@ def run_sft_training(config):
         return_tensors="pt"
     )
     
+    # Fix: Convert validation data to a PyTorch Dataset
+    val_dataset = TokenizedDataset(tokenized_val_data)
+    
     # 配置训练参数（优化显存使用）
     training_args = TrainingArguments(
         output_dir=config.sft_output_dir,
@@ -394,27 +181,31 @@ def run_sft_training(config):
         logging_dir='./logs',
         logging_steps=10,
         save_strategy="epoch",
-        evaluation_strategy="epoch",  # 每个epoch后评估
         fp16=True,
-        report_to="none",
+        report_to="wandb",
         optim="paged_adamw_8bit",  # 分页优化器减少内存峰值
-        gradient_checkpointing=True  # 梯度检查点节省显存
+        gradient_checkpointing=True,  # 梯度检查点节省显存
+        remove_unused_columns=False,  # 防止移除梯度计算所需的列
+        dataloader_num_workers=4,    # 添加数据加载器工作线程
     )
     
-    # 创建Trainer（包含验证集）
+    # 修复4: 确保模型设置为训练模式
+    model.train()
+
+    # Fix: Ensure labels are passed correctly during training
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_data,
-        eval_dataset=tokenized_val_data,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
         data_collator=data_collator,
     )
-    
-    # 开始训练
+
+    # Start training
     print("Starting SFT training...")
     trainer.train()
-    
-    # 保存模型
+
+    # Save the model
     model.save_pretrained(config.sft_output_dir)
     tokenizer.save_pretrained(config.sft_output_dir)
     print(f"SFT model saved to {config.sft_output_dir}")
@@ -423,8 +214,13 @@ def run_sft_training(config):
 def run_ppo_training(config):
     # 加载SFT模型
     tokenizer = AutoTokenizer.from_pretrained(config.sft_output_dir)
+    
+    # Load config explicitly
+    model_config = AutoConfig.from_pretrained(config.sft_output_dir)
+    
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         config.sft_output_dir,
+        config=model_config,
         quantization_config=config.bnb_config if config.use_4bit else None,
         torch_dtype=torch.bfloat16,
         device_map="auto",
@@ -437,7 +233,17 @@ def run_ppo_training(config):
     
     # 准备数据集（只使用训练集）
     train_dataset = WebPuzzleDataset(config, tokenizer, mode='train')
-    ppo_data = [train_dataset.format_for_ppo(item) for item in train_dataset.data]
+    
+    # 修改1: PPO数据应包含查询、响应、奖励等信息
+    ppo_data = []
+    for item in train_dataset.data:
+        formatted = train_dataset.format_for_ppo(item)
+        ppo_data.append({
+            "query": formatted,
+            "prompt": item["prompt"],
+            "answer": item["answer"],
+            "difficulty": item["difficulty"]
+        })
     
     # 创建PPO配置
     ppo_config = PPOConfig(
@@ -462,7 +268,7 @@ def run_ppo_training(config):
         dataset=ppo_data
     )
     
-    # 生成设置
+    # 生成设置 - 更严格的参数控制
     generation_kwargs = {
         "min_length": -1,
         "top_k": 0.0,
@@ -470,17 +276,18 @@ def run_ppo_training(config):
         "do_sample": True,
         "pad_token_id": tokenizer.eos_token_id,
         "max_new_tokens": 128,  # 减少生成长度节省显存
+        "output_scores": True,  # 需要输出分数用于奖励计算
+        "return_dict_in_generate": True  # 返回字典格式
     }
     
     # 初始化搜索工具
     searcher = DuckDuckGoSearcher(max_results=2)  # 减少搜索结果节省资源
     
     # 奖励函数 - 根据论文设计（优化版）
-    def reward_function(responses, prompts):
+    def reward_function(responses, prompts, answers, difficulties):
         rewards = []
         for response, prompt in zip(responses, prompts):
             # 1. 基本奖励：回答是否包含正确答案
-            answer = next((item["answer"] for item in train_dataset.data if item["prompt"] == prompt), "")
             if answer and answer in response:
                 reward = 1.0
             else:
@@ -496,7 +303,6 @@ def run_ppo_training(config):
             reward += min(reflection_count * 0.3, 1.5)
             
             # 4. 难度奖励：困难问题额外奖励
-            difficulty = next((item["difficulty"] for item in train_dataset.data if item["prompt"] == prompt), "medium")
             if difficulty == "hard":
                 reward += 0.5
             elif difficulty == "outlier":
@@ -518,14 +324,23 @@ def run_ppo_training(config):
             
         # 获取查询
         queries = batch["query"]
+        prompts = [item["prompt"] for item in ppo_data if item["query"] in queries]
+        answers = [item["answer"] for item in ppo_data if item["query"] in queries]
+        difficulties = [item["difficulty"] for item in ppo_data if item["query"] in queries]
         
-        # 生成响应
+        # 确保数据在正确的设备上
+        query_tensors = [torch.tensor(tokenizer.encode(q, add_special_tokens=False)).to(model.device) for q in queries]
+        
+        # 生成响应 - 使用更安全的方式
         response_tensors = []
         responses = []
-        for query in queries:
-            inputs = tokenizer(query, return_tensors="pt").to(model.device)
-            response = model.generate(**inputs, **generation_kwargs)
-            response_tensor = response.squeeze()[-generation_kwargs["max_new_tokens"]:]
+        for query_tensor in query_tensors:
+            response = model.generate(
+                input_ids=query_tensor.unsqueeze(0),
+                **generation_kwargs
+            )
+            # 提取生成的内容
+            response_tensor = response.sequences[0][query_tensor.shape[0]:]
             response_text = tokenizer.decode(response_tensor, skip_special_tokens=True)
             
             # 处理搜索请求
@@ -534,21 +349,30 @@ def run_ppo_training(config):
                 search_query = response_text.split("搜索：")[1].split("\n")[0].strip()
                 
                 # 执行实际搜索
-                search_results = searcher.search(search_query)
-                formatted_results = searcher.format_results(search_results)
-                
-                # 添加到响应中
-                response_text += f"\n搜索结果：{formatted_results}\n"
+                try:
+                    search_results = searcher.search(search_query)
+                    formatted_results = searcher.format_results(search_results)
+                    # 添加到响应中
+                    response_text += f"\n搜索结果：{formatted_results}\n"
+                except Exception as e:
+                    print(f"Search error: {e}")
             
             response_tensors.append(response_tensor)
             responses.append(response_text)
         
         # 计算奖励
-        rewards = reward_function(responses, queries)
+        rewards = reward_function(responses, prompts, answers, difficulties)
         
-        # PPO更新
-        stats = ppo_trainer.step(response_tensors, rewards)
-        ppo_trainer.log_stats(stats, batch, rewards)
+        # 确保张量在正确的设备上
+        rewards = rewards.to(model.device)
+        
+        # PPO更新 - 更健壮的错误处理
+        try:
+            stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
+            ppo_trainer.log_stats(stats, batch, rewards)
+        except Exception as e:
+            print(f"PPO step error: {e}")
+            continue
         
         # 定期保存检查点
         if step % 100 == 0:
@@ -659,74 +483,6 @@ def evaluate_ppo_model(config, model, tokenizer, step):
     print(f"Accuracy: {accuracy:.2%}")
     print(f"Average Searches: {avg_search:.2f}")
 
-# 6. 搜索推理模块（集成DuckDuckGo）
-class DeepDiverAgent:
-    def __init__(self, config):
-        # 加载模型
-        self.tokenizer = AutoTokenizer.from_pretrained(config.ppo_output_dir)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            config.ppo_output_dir,
-            quantization_config=config.bnb_config if config.use_4bit else None,
-            torch_dtype=torch.bfloat16,
-            device_map="auto"
-        )
-        self.model.eval()
-        
-        # 初始化搜索工具
-        self.searcher = DuckDuckGoSearcher(max_results=3)
-        self.max_steps = 5
-        self.max_search_queries = 5  # 限制搜索查询次数
-        
-    def generate(self, prompt):
-        """生成推理过程（集成真实搜索）"""
-        full_response = ""
-        search_count = 0
-        search_queries = []
-        
-        for step in range(self.max_steps):
-            # 准备输入
-            input_text = prompt + full_response
-            inputs = self.tokenizer(input_text, return_tensors="pt").to(self.model.device)
-            
-            # 生成下一步
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=128,
-                do_sample=True,
-                temperature=0.7,
-                pad_token_id=self.tokenizer.eos_token_id,
-                early_stopping=True  # 提前停止节省资源
-            )
-            
-            # 解码响应
-            new_text = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-            full_response += new_text
-            
-            # 检查是否需要搜索
-            if "搜索：" in new_text and search_count < self.max_search_queries:
-                search_count += 1
-                # 提取搜索查询
-                search_query = new_text.split("搜索：")[1].split("\n")[0].strip()
-                search_queries.append(search_query)
-                
-                # 执行真实搜索
-                search_results = self.searcher.search(search_query)
-                formatted_results = self.searcher.format_results(search_results)
-                
-                # 添加到上下文
-                full_response += f"\n搜索结果：{formatted_results}\n"
-            
-            # 检查是否给出最终答案
-            if "答案：" in new_text:
-                break
-        
-        return {
-            "response": full_response,
-            "search_count": search_count,
-            "search_queries": search_queries,
-            "steps": step + 1
-        }
-
 # 7. 最终评估模块
 def evaluate_agent(config, test_data_path=None):
     """评估DeepDiver代理"""
@@ -770,7 +526,7 @@ def evaluate_agent(config, test_data_path=None):
     
     return results
 
-# 8. 主流程
+# 3. Main Training Flow (Refactored)
 if __name__ == "__main__":
     # 初始化配置
     config = DeepDiverConfig()
