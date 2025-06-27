@@ -24,7 +24,7 @@ import re
 class DeepDiverConfig:
     def __init__(self):
         # 模型设置 - 使用4-bit量化
-        self.model_name = "Qwen/Qwen1.5-1.8B"  # 更小模型节省显存
+        self.model_name = "Qwen/Qwen2.5-3B"  # 更小模型节省显存
         self.use_4bit = True
         self.bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
