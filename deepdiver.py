@@ -30,11 +30,11 @@ from search_module import DuckDuckGoSearcher
 from reward_module import calculate_reward
 from agent_module import DeepDiverAgent
 
-# 1. 配置参数（显存优化版）
+#################### Config ####################
 class DeepDiverConfig:
     def __init__(self):
         # 模型设置 - 使用4-bit量化
-        self.model_name = "Qwen/Qwen2.5-3B"  # 更小模型节省显存
+        self.model_name = "Qwen/Qwen2.5-3B" 
         self.use_4bit = False
         self.bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -94,9 +94,9 @@ class TokenizedDataset(torch.utils.data.Dataset):
             item[key] = tensor
         return item
 
-# 4. 冷启动监督微调（SFT）
+#################### Cold Start SFT ####################
 def run_sft_training(config):
-    # 加载模型和分词器
+    # Load model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     model_kwargs = {}
     
@@ -526,27 +526,37 @@ def evaluate_agent(config, test_data_path=None):
     
     return results
 
-# 3. Main Training Flow (Refactored)
-if __name__ == "__main__":
-    # 初始化配置
+#################### CLI ####################
+import argparse
+def main():
+    parser = argparse.ArgumentParser(description='DeepDiver Training CLI')
+    parser.add_argument('--stage', choices=['sft', 'ppo', 'eval'], required=True,
+                        help='Choose the stage to run: sft (Supervised Fine-Tuning), '
+                             'ppo (Proximal Policy Optimization), or eval (Final Evaluation)')
+    args = parser.parse_args()
+
+    # Init config
     config = DeepDiverConfig()
-    
-    # 阶段1: 监督微调
-    print("="*50)
-    print("Starting Supervised Fine-Tuning (SFT)")
-    print("="*50)
-    run_sft_training(config)
-    
-    # 阶段2: 强化学习训练
-    print("\n" + "="*50)
-    print("Starting Proximal Policy Optimization (PPO)")
-    print("="*50)
-    run_ppo_training(config)
-    
-    # 阶段3: 最终评估
-    print("\n" + "="*50)
-    print("Starting Final Evaluation")
-    print("="*50)
-    evaluate_agent(config)
-    
+
+    if args.stage == 'sft':
+        print("=" * 50)
+        print("Starting Supervised Fine-Tuning (SFT)")
+        print("=" * 50)
+        run_sft_training(config)
+
+    elif args.stage == 'ppo':
+        print("\n" + "=" * 50)
+        print("Starting Proximal Policy Optimization (PPO)")
+        print("=" * 50)
+        run_ppo_training(config)
+
+    elif args.stage == 'eval':
+        print("\n" + "=" * 50)
+        print("Starting Final Evaluation")
+        print("=" * 50)
+        evaluate_agent(config)
+
     print("\nOpen DeepDiver training completed!")
+
+if __name__ == "__main__":
+    main()
