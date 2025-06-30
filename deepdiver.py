@@ -14,7 +14,9 @@ from transformers import (
     TrainingArguments,
     Trainer,
     DataCollatorForLanguageModeling,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    modeling_utils, # Fix: TypeError: argument of type 'NoneType' is not iterable
+    GenerationConfig
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
@@ -23,6 +25,7 @@ import requests
 from bs4 import BeautifulSoup
 from bs4.element import Comment
 import numpy as np
+import copy
 
 # New imports for modularized components
 from dataset_module import WebPuzzleDataset
@@ -108,6 +111,13 @@ def run_sft_training(config):
     
     # Load config explicitly
     model_config = AutoConfig.from_pretrained(config.model_name)
+    model_config.generation_config = {
+        "bos_token_id": 151643,
+        "do_sample": false,
+        "eos_token_id": 151643,
+        "max_new_tokens": 2048,
+        "transformers_version": "4.37.0"
+    }
     
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
@@ -206,30 +216,46 @@ def run_sft_training(config):
     trainer.train()
 
     # Save the model
+    print("Saving model and configuration...")
     model.save_pretrained(config.sft_output_dir)
     tokenizer.save_pretrained(config.sft_output_dir)
+    model.config.to_json_file(os.path.join(config.sft_output_dir, "config.json"))  # Ensure config is written
     print(f"SFT model saved to {config.sft_output_dir}")
 
 # 5. 强化学习训练（PPO）
 def run_ppo_training(config):
-    # 加载SFT模型
+    # Load SFT model
     tokenizer = AutoTokenizer.from_pretrained(config.sft_output_dir)
     
-    # Load config explicitly
+    # Load config explicitly - UNCOMMENTED and FIXED
     model_config = AutoConfig.from_pretrained(config.sft_output_dir)
-    
+
+    # Fix: Use GenerationConfig instead of raw dict
+    generation_config_dict = {
+        "bos_token_id": 151643,
+        "do_sample": False,
+        "eos_token_id": 151643,
+        "max_new_tokens": 2048,
+        "transformers_version": "4.37.0"
+    }
+    model_config.generation_config = GenerationConfig.from_dict(generation_config_dict)
+
+    if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
+        modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
+
+    # Load model with updated config
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
         config.sft_output_dir,
-        config=model_config,
-        quantization_config=config.bnb_config if config.use_4bit else None,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        peft_config=LoraConfig(
-            r=config.lora_rank,
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
-        )
     )
+
+    # Assign the correct generation config object
+    model.generation_config = model_config.generation_config
+
+    # Set eos_token_id and pad_token_id directly on the GenerationConfig object
+    model.generation_config.eos_token_id = tokenizer.eos_token_id
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
     
     # 准备数据集（只使用训练集）
     train_dataset = WebPuzzleDataset(config, tokenizer, mode='train')
@@ -245,28 +271,55 @@ def run_ppo_training(config):
             "difficulty": item["difficulty"]
         })
     
-    # 创建PPO配置
+
     ppo_config = PPOConfig(
         batch_size=config.ppo_batch_size,
         mini_batch_size=1,
-        ppo_epochs=config.ppo_epochs,
+        num_ppo_epochs=config.ppo_epochs,
         learning_rate=config.learning_rate,
-        log_with=None,
-        steps=config.ppo_steps,
+        total_episodes=config.ppo_steps,
         gamma=config.gamma,
         lam=config.lam,
         cliprange=config.cliprange,
         cliprange_value=config.cliprange_value,
-        optimize_cuda_cache=True,
     )
     
-    # 创建PPO Trainer
-    ppo_trainer = PPOTrainer(
-        config=ppo_config,
-        model=model,
-        tokenizer=tokenizer,
-        dataset=ppo_data
+    # FIX: Set the base_model_prefix explicitly
+    model.base_model_prefix = "model"
+    model.pretrained_model.base_model_prefix = "model"
+    
+    # FIX: Create reference model properly
+    ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        config.sft_output_dir,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
     )
+    
+    # FIX: Set base_model_prefix for ref_model too
+    ref_model.base_model_prefix = "model"
+    ref_model.pretrained_model.base_model_prefix = "model"
+
+    # ADDITION: Define processing_class as the tokenizer
+    processing_class = tokenizer
+
+    # ADDITION: Define reward_model (placeholder for now, replace with actual implementation if needed)
+    reward_model = None  # Placeholder; implement a custom reward model if necessary
+
+    # FIX: Pass all required arguments to PPOTrainer
+    ppo_trainer = PPOTrainer(
+        ppo_config,
+        model=model,
+        ref_model=ref_model,  # Use the properly initialized ref_model
+        #tokenizer=tokenizer,   # Pass tokenizer directly
+        train_dataset=train_dataset, # Use dataset instead of train_dataset
+        processing_class=processing_class,  # Added processing_class
+        reward_model=reward_model,  # Added reward_model
+        value_model=model,  # Use the value head from the model
+    )
+    
+    # Set generation config properly
+    model.generation_config.eos_token_id = tokenizer.eos_token_id
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
     
     # 生成设置 - 更严格的参数控制
     generation_kwargs = {
@@ -281,7 +334,7 @@ def run_ppo_training(config):
     }
     
     # 初始化搜索工具
-    searcher = DuckDuckGoSearcher(max_results=2)  # 减少搜索结果节省资源
+    searcher = DuckDuckGoSearcher(max_results=4)  # 减少搜索结果节省资源
     
     # 奖励函数 - 根据论文设计（优化版）
     def reward_function(responses, prompts, answers, difficulties):
