@@ -1,14 +1,24 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from search_module import DuckDuckGoSearcher
+import torch
 
 class DeepDiverAgent:
     def __init__(self, config):
-        self.tokenizer = AutoTokenizer.from_pretrained(config.ppo_output_dir)
+        from transformers import modeling_utils
+        if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
+            modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
+
+        # Fix: Ensure tokenizer uses local_files_only=True
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.sft_output_dir,
+            local_files_only=True
+        )
         self.model = AutoModelForCausalLM.from_pretrained(
-            config.ppo_output_dir,
+            config.ppo_output_dir, # Changed from "./sft_model" to use same path as tokenizer
             quantization_config=config.bnb_config if config.use_4bit else None,
             torch_dtype=torch.bfloat16,
-            device_map="auto"
+            device_map="auto",
+            local_files_only=True  # Ensure local files only
         )
         self.model.eval()
         self.searcher = DuckDuckGoSearcher(max_results=3)
