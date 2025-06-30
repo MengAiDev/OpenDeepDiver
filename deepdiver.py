@@ -1,4 +1,4 @@
-# 修改后的 deepdiver.py 完整代码
+# deepdiver.py 修复版（保持模型结构不变）
 
 import os
 import json
@@ -17,20 +17,21 @@ from transformers import (
     Trainer,
     DataCollatorForLanguageModeling,
     BitsAndBytesConfig,
-    modeling_utils,
-    GenerationConfig,
+    modeling_utils, # Fix: TypeError: argument of type 'NoneType' is not iterable
+    GenerationConfig
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead, create_reference_model
 from duckduckgo_search import DDGS
 import requests
 from bs4 import BeautifulSoup
 from bs4.element import Comment
 import numpy as np
 import copy
-# 新增模块
-from torch.nn import CrossEntropyLoss
-from datasets import load_dataset
+# New imports for modularized components
+from dataset_module import WebPuzzleDataset
+from search_module import DuckDuckGoSearcher
+from reward_module import calculate_reward
+from agent_module import DeepDiverAgent
 
 #################### Config ####################
 class DeepDiverConfig:
@@ -53,17 +54,15 @@ class DeepDiverConfig:
         self.gradient_accumulation_steps = 8  # 梯度累积
         self.learning_rate = 1e-5
         self.num_train_epochs = 2  # 减少训练轮次
-        self.max_seq_length = 512  # 缩短序列长度节省显存
+        self.max_seq_length = 1024  # 减少序列长度节省显存
         # PPO参数
         self.ppo_batch_size = 1  # PPO批量设为1
         self.ppo_epochs = 1
         self.ppo_steps = 500  # 减少PPO步数
         self.gamma = 0.99
         self.lam = 0.95
-        self.cliprange = 0.1  # 减小Clip范围提高稳定性
-        self.cliprange_value = 0.1
-        # KL散度控制
-        self.kl_coef = 0.1  # 添加KL惩罚系数
+        self.cliprange = 0.2
+        self.cliprange_value = 0.2
         # 路径设置
         self.dataset_path = "webpuzzle_dataset_3735.jsonl"  # 3735条数据
         self.output_dir = "./deepdiver_output"
@@ -102,11 +101,13 @@ def run_sft_training(config):
     model_kwargs["device_map"] = "cuda" if torch.cuda.is_available() else "cpu"
     # Load config explicitly
     model_config = AutoConfig.from_pretrained(config.model_name)
-    # 修复1: 禁用缓存并启用输入梯度要求
-    model_config.use_cache = False
-    model_config.generation_config = GenerationConfig.from_pretrained(config.model_name)
-    model_config.generation_config.pad_token_id = tokenizer.eos_token_id
-    model_config.generation_config.eos_token_id = tokenizer.eos_token_id
+    model_config.generation_config = {
+        "bos_token_id": 151643,
+        "do_sample": False,
+        "eos_token_id": 151643,
+        "max_new_tokens": 2048,
+        "transformers_version": "4.37.0"
+    }
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         config=model_config,
@@ -121,10 +122,10 @@ def run_sft_training(config):
         task_type="CAUSAL_LM",
         inference_mode=False
     )
-    # 修复2: 确保模型准备正确
+    # 修复1: 确保模型准备正确
     model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, peft_config)
-    # 修复3: 禁用缓存并启用输入梯度要求
+    # 修复2: 禁用缓存并启用输入梯度要求
     model.config.use_cache = False
     model.enable_input_require_grads()
     model.print_trainable_parameters()
@@ -190,33 +191,17 @@ def run_sft_training(config):
     trainer.train()
     # Save the model
     print("Saving model and configuration...")
-    model.save_pretrained(config.sft_output_dir)
+    # 修复：保存完整模型而不仅仅是适配器
+    model.save_pretrained(config.sft_output_dir, safe_serialization=True)
     tokenizer.save_pretrained(config.sft_output_dir)
     model.config.to_json_file(os.path.join(config.sft_output_dir, "config.json"))  # Ensure config is written
     print(f"SFT model saved to {config.sft_output_dir}")
-
-# 新增: 奖励模型定义
-class RewardModel(torch.nn.Module):
-    def __init__(self, base_model):
-        super().__init__()
-        self.base_model = base_model
-        self.value_head = torch.nn.Linear(base_model.config.hidden_size, 1)
-    
-    def forward(self, input_ids, attention_mask=None):
-        outputs = self.base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True
-        )
-        hidden_states = outputs.hidden_states[-1]
-        values = self.value_head(hidden_states).squeeze(-1)
-        return values
 
 # 5. 强化学习训练（PPO）
 def run_ppo_training(config):
     # Load SFT model
     tokenizer = AutoTokenizer.from_pretrained(config.sft_output_dir)
-    # Load config explicitly - UNCOMMENTED and FIXED
+    # Load config explicitly
     model_config = AutoConfig.from_pretrained(config.sft_output_dir)
     # Fix: Use GenerationConfig instead of raw dict
     generation_config_dict = {
@@ -227,30 +212,31 @@ def run_ppo_training(config):
         "transformers_version": "4.37.0"
     }
     model_config.generation_config = GenerationConfig.from_dict(generation_config_dict)
-    if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
-        modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
-    # Load model with updated config
-    model = AutoModelForCausalLM.from_pretrained(
+    
+    # Load base model (without Value Head)
+    base_model = AutoModelForCausalLM.from_pretrained(
         config.sft_output_dir,
         config=model_config,
         torch_dtype=torch.bfloat16,
         device_map="auto",
     )
-    # 创建带Value Head的模型
-    model_with_value = AutoModelForCausalLMWithValueHead(model)
-    # 创建参考模型
-    ref_model = create_reference_model(model)
-    # 创建奖励模型
-    reward_model = RewardModel(model)
-    # 设置生成配置
+    
+    # Create model with Value Head
+    model_with_value = AutoModelForCausalLMWithValueHead(base_model)  # 自动添加Value Head
+    
+    # Create reference model using create_reference_model
+    ref_model = create_reference_model(model_with_value)  # 使用TRL工具创建参考模型
+    
+    # Assign the correct generation config object
     model_with_value.generation_config = model_config.generation_config
     model_with_value.generation_config.eos_token_id = tokenizer.eos_token_id
     model_with_value.generation_config.pad_token_id = tokenizer.pad_token_id
+    
     # 准备数据集（只使用训练集）
     train_dataset = WebPuzzleDataset(config, tokenizer, mode='train')
     # 修改1: PPO数据应包含查询、响应、奖励等信息
     ppo_data = []
-    for item in train_dataset.
+    for item in train_dataset.data:
         formatted = train_dataset.format_for_ppo(item)
         ppo_data.append({
             "query": formatted,
@@ -258,6 +244,7 @@ def run_ppo_training(config):
             "answer": item["answer"],
             "difficulty": item["difficulty"]
         })
+    
     ppo_config = PPOConfig(
         batch_size=config.ppo_batch_size,
         mini_batch_size=1,
@@ -268,56 +255,70 @@ def run_ppo_training(config):
         lam=config.lam,
         cliprange=config.cliprange,
         cliprange_value=config.cliprange_value,
-        kl_coef=config.kl_coef,  # 添加KL系数
     )
-    # Fix: Set the base_model_prefix explicitly
-    model_with_value.base_model_prefix = "model"
+    
     # ADDITION: Define processing_class as the tokenizer
     processing_class = tokenizer
+    
     # FIX: Pass all required arguments to PPOTrainer
     ppo_trainer = PPOTrainer(
         ppo_config,
         model=model_with_value,
         ref_model=ref_model,  # Use the properly initialized ref_model
+        train_dataset=train_dataset, # Use dataset instead of train_dataset
         processing_class=processing_class,  # Added processing_class
-        reward_model=reward_model,  # Added reward_model
+        reward_model=None,  # Placeholder; implement a custom reward model if necessary
         value_model=model_with_value,  # Use the value head from the model
     )
+    
+    # Set generation config properly
+    model_with_value.generation_config.eos_token_id = tokenizer.eos_token_id
+    model_with_value.generation_config.pad_token_id = tokenizer.pad_token_id
+    
     # 生成设置 - 更严格的参数控制
     generation_kwargs = {
-        "min_length": 10,  # 修正min_length
-        "top_k": 50,       # 修正top_k
-        "top_p": 0.95,
+        "min_length": 10,  # 修正非法参数
+        "top_k": 50,       # 修正非法参数
+        "top_p": 1.0,
         "do_sample": True,
         "pad_token_id": tokenizer.eos_token_id,
         "max_new_tokens": 128,  # 减少生成长度节省显存
         "output_scores": True,  # 需要输出分数用于奖励计算
         "return_dict_in_generate": True  # 返回字典格式
     }
+    
     # 初始化搜索工具
     searcher = DuckDuckGoSearcher(max_results=4)  # 减少搜索结果节省资源
-    # 奖励函数 - 标准化处理
+    
+    # 奖励函数 - 根据论文设计（优化版）
     def reward_function(responses, prompts, answers, difficulties):
         rewards = []
         for response, prompt, answer, difficulty in zip(responses, prompts, answers, difficulties):
-            # 基础奖励
-            base_reward = 1.0 if answer and answer in response else 0.0
-            # 搜索奖励
+            # 1. 基本奖励：回答是否包含正确答案
+            if answer and answer in response:
+                reward = 1.0
+            else:
+                reward = 0.0
+            # 2. 搜索强度奖励：搜索操作的数量
             search_count = response.count("搜索：")
-            search_reward = min(search_count * 0.2, 1.0)
-            # 反思奖励
+            if search_count > 0:
+                reward += min(search_count * 0.2, 1.0)
+            # 3. 反思奖励：反思操作的数量
             reflection_count = response.count("反思：")
-            reflection_reward = min(reflection_count * 0.3, 1.5)
-            # 难度奖励
-            difficulty_reward = 0.5 if difficulty == "hard" else (1.0 if difficulty == "outlier" else 0.0)
-            # 长度惩罚
-            length_penalty = -0.3 if len(response) > 500 else 0.0
-            # 总奖励
-            total_reward = base_reward + search_reward + reflection_reward + difficulty_reward + length_penalty
-            rewards.append(total_reward)
+            reward += min(reflection_count * 0.3, 1.5)
+            # 4. 难度奖励：困难问题额外奖励
+            if difficulty == "hard":
+                reward += 0.5
+            elif difficulty == "outlier":
+                reward += 1.0
+            # 5. 效率惩罚：过长响应惩罚
+            if len(response) > 500:
+                reward -= 0.3
+            rewards.append(reward)
         # 标准化奖励
         rewards = torch.tensor(rewards, dtype=torch.float32)
         return (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+    
     # PPO训练循环（完整实现）
     print("Starting PPO training...")
     for step, batch in tqdm(enumerate(ppo_trainer.dataloader), total=min(config.ppo_steps, len(ppo_trainer.dataloader))):
@@ -328,8 +329,10 @@ def run_ppo_training(config):
         prompts = [item["prompt"] for item in ppo_data if item["query"] in queries]
         answers = [item["answer"] for item in ppo_data if item["query"] in queries]
         difficulties = [item["difficulty"] for item in ppo_data if item["query"] in queries]
+        
         # 确保数据在正确的设备上
         query_tensors = [torch.tensor(tokenizer.encode(q, add_special_tokens=True)).to(model_with_value.device) for q in queries]
+        
         # 生成响应 - 使用更安全的方式
         response_tensors = []
         responses = []
@@ -355,28 +358,27 @@ def run_ppo_training(config):
                     print(f"Search error: {e}")
             response_tensors.append(response_tensor)
             responses.append(response_text)
+        
         # 计算奖励
         rewards = reward_function(responses, prompts, answers, difficulties)
         # 确保张量在正确的设备上
         rewards = rewards.to(model_with_value.device)
+        
         # PPO更新 - 更健壮的错误处理
         try:
             stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
             ppo_trainer.log_stats(stats, batch, rewards)
-            # 监控KL散度
-            kl_divergence = stats["objective/kl"]
-            if kl_divergence > 0.5:  # 若KL过大，终止当前步
-                print(f"KL Divergence {kl_divergence} exceeds threshold, skipping step {step}")
-                continue
         except Exception as e:
             print(f"PPO step error: {e}")
             continue
+        
         # 定期保存检查点
         if step % 100 == 0:
             model_with_value.save_pretrained(f"{config.ppo_output_dir}/step_{step}")
             print(f"Saved checkpoint at step {step}")
             # 在验证集上进行评估
             evaluate_ppo_model(config, model_with_value, tokenizer, step)
+    
     # 保存最终模型
     model_with_value.save_pretrained(config.ppo_output_dir)
     tokenizer.save_pretrained(config.ppo_output_dir)
@@ -463,7 +465,10 @@ def evaluate_agent(config, test_data_path=None):
     """评估DeepDiver代理"""
     # 加载验证集
     val_dataset = WebPuzzleDataset(config, None, mode='val')
-    # 初始化代理
+    # 初始化代理 - 修改: 使用SFT模型路径
+    config.model_name = config.sft_output_dir  # Set model path to SFT output
+    # Fix: Ensure model config is explicitly loaded
+    config.model_config = AutoConfig.from_pretrained(config.sft_output_dir)
     agent = DeepDiverAgent(config)
     results = []
     for item in tqdm(val_dataset.data, desc="Evaluating"):
@@ -497,9 +502,9 @@ def evaluate_agent(config, test_data_path=None):
 import argparse
 def main():
     parser = argparse.ArgumentParser(description='DeepDiver Training CLI')
-    parser.add_argument('--stage', choices=['sft', 'ppo', 'eval'], required=True,
+    parser.add_argument('--stage', choices=['sft', 'eval'], required=True,
                         help='Choose the stage to run: sft (Supervised Fine-Tuning), '
-                             'ppo (Proximal Policy Optimization), or eval (Final Evaluation)')
+                             'or eval (Final Evaluation)')
     args = parser.parse_args()
     # Init config
     config = DeepDiverConfig()
@@ -522,3 +527,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
